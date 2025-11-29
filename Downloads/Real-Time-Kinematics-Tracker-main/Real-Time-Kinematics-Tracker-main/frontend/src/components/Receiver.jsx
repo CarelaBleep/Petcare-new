@@ -1,46 +1,149 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet';
+import 'leaflet/dist/leaflet.css';
+import L from 'leaflet';
+
+
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+});
+
+
+function CompassControl() {
+  const map = useMap();
+  
+  useEffect(() => {
+    const compassDiv = L.DomUtil.create('div', 'leaflet-control-compass');
+    compassDiv.innerHTML = `
+      <div style="background: white; padding: 8px; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); font-size: 11px; font-weight: bold; text-align: center; line-height: 1.4;">
+        <div style="margin-bottom: 2px;">N</div>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <span>W</span>
+          <span style="font-size: 16px; margin: 0 6px;">⊕</span>
+          <span>E</span>
+        </div>
+        <div style="margin-top: 2px;">S</div>
+      </div>
+    `;
+    
+    const compassControl = L.Control.extend({
+      options: { position: 'topright' },
+      onAdd: function() { return compassDiv; }
+    });
+    
+    const control = new compassControl();
+    control.addTo(map);
+    
+    return () => {
+      control.remove();
+    };
+  }, [map]);
+  
+  return null;
+}
+
+
+function MapUpdater({ center }) {
+  const map = useMap();
+  
+  useEffect(() => {
+    if (center) {
+      map.setView(center, 16);
+    }
+  }, [center, map]);
+  
+  return null;
+}
 
 function Receiver() {
   const [location, setLocation] = useState(null);
   const [previousLocation, setPreviousLocation] = useState(null);
   const [stats, setStats] = useState(null);
+  const [previousStats, setPreviousStats] = useState(null);
   const [error, setError] = useState(null);
   const [isPolling, setIsPolling] = useState(false);
 
   const API_URL = 'http://192.168.1.163:3001';
+  const OPENROUTE_API_KEY = 'eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjVlNmRkOGFmZjY1YzQyZWJiMjM3YWVjZTMzNDYwMzM1IiwiaCI6Im11cm11cjY0In0='; // Replace with your API key from https://openrouteservice.org
 
-  // Haversine formula to calculate distance between two GPS coordinates
-  const haversineDistance = (lat1, lon1, lat2, lon2) => {
-    const R = 6371e3; // Earth's radius in meters
-    const φ1 = (lat1 * Math.PI) / 180;
-    const φ2 = (lat2 * Math.PI) / 180;
-    const Δφ = ((lat2 - lat1) * Math.PI) / 180;
-    const Δλ = ((lon2 - lon1) * Math.PI) / 180;
 
-    const a =
-      Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-      Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-    return R * c; // Distance in meters
+  const getDistanceFromOpenRoute = async (lat1, lon1, lat2, lon2) => {
+    try {
+      const url = `https://api.openrouteservice.org/v2/matrix/driving`;
+      
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': OPENROUTE_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          locations: [[lon1, lat1], [lon2, lat2]],
+          metrics: ['distance']
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.distances && data.distances[0] && data.distances[0][1]) {
+        return data.distances[0][1]; 
+      }
+      
+      throw new Error('Unable to calculate distance from OpenRouteService API');
+    } catch (err) {
+      console.error('OpenRouteService API error:', err);
+      return null;
+    }
   };
 
-  const calculateStats = (current, previous) => {
+  const calculateStats = async (current, previous, prevStats) => {
     if (!previous) return null;
 
-    const distance = haversineDistance(
+    const distance = await getDistanceFromOpenRoute(
       previous.latitude,
       previous.longitude,
       current.latitude,
       current.longitude
     );
 
-    const timeDiff = (current.timestamp - previous.timestamp) / 1000; // seconds
-    const speed = timeDiff > 0 ? distance / timeDiff : 0;
+    if (distance === null) {
+      setError('Failed to calculate distance using OpenRouteService API');
+      return null;
+    }
 
-    // Calculate velocity components (degrees per second)
-    const latVelocity = timeDiff > 0 ? (current.latitude - previous.latitude) / timeDiff : 0;
-    const lonVelocity = timeDiff > 0 ? (current.longitude - previous.longitude) / timeDiff : 0;
+    // Time difference in seconds: Δt = t₂ - t₁
+    const timeDiff = (current.timestamp - previous.timestamp) / 1000;
+    
+    if (timeDiff === 0) return null;
+
+    // Speed (scalar): v = distance / time
+    const speed = distance / timeDiff;
+
+    // Velocity components (vector): v = Δs / Δt
+    const latDisplacement = current.latitude - previous.latitude;
+    const lonDisplacement = current.longitude - previous.longitude;
+    const latVelocity = latDisplacement / timeDiff;
+    const lonVelocity = lonDisplacement / timeDiff;
+
+    // Velocity magnitude (m/s)
+    const velocityMagnitude = speed;
+
+    // Acceleration: a = (v₂ - v₁) / Δt
+    let acceleration = 0;
+    let latAcceleration = 0;
+    let lonAcceleration = 0;
+    
+    if (prevStats) {
+      // Acceleration (scalar): a = Δv / Δt
+      acceleration = (speed - parseFloat(prevStats.speed)) / timeDiff;
+      
+      // Acceleration components (vector): a = Δv / Δt
+      latAcceleration = (latVelocity - parseFloat(prevStats.velocity.lat)) / timeDiff;
+      lonAcceleration = (lonVelocity - parseFloat(prevStats.velocity.lon)) / timeDiff;
+    }
 
     return {
       distance: distance.toFixed(2),
@@ -48,7 +151,13 @@ function Receiver() {
       timeDiff: timeDiff.toFixed(2),
       velocity: {
         lat: latVelocity.toFixed(8),
-        lon: lonVelocity.toFixed(8)
+        lon: lonVelocity.toFixed(8),
+        magnitude: velocityMagnitude.toFixed(2)
+      },
+      acceleration: {
+        scalar: acceleration.toFixed(4),
+        lat: latAcceleration.toFixed(8),
+        lon: lonAcceleration.toFixed(8)
       }
     };
   };
@@ -71,11 +180,14 @@ function Receiver() {
       if (data && data.latitude) {
         setError(null);
         
-        // If we have a previous location, calculate stats
+        
         if (location && location.timestamp !== data.timestamp) {
-          const calculatedStats = calculateStats(data, location);
-          setStats(calculatedStats);
-          setPreviousLocation(location);
+          const calculatedStats = await calculateStats(data, location, stats);
+          if (calculatedStats) {
+            setPreviousStats(stats);
+            setStats(calculatedStats);
+            setPreviousLocation(location);
+          }
         }
         
         setLocation(data);
@@ -99,13 +211,14 @@ function Receiver() {
     setLocation(null);
     setPreviousLocation(null);
     setStats(null);
+    setPreviousStats(null);
     setError(null);
   };
 
   useEffect(() => {
     let interval;
     if (isPolling) {
-      interval = setInterval(fetchLocation, 3000); // Poll every 3 seconds
+      interval = setInterval(fetchLocation, 3000); 
     }
     return () => clearInterval(interval);
   }, [isPolling, location]);
@@ -160,12 +273,55 @@ function Receiver() {
         <div className="card">
           <h3 style={{ marginTop: 0 }}>Calculated Statistics</h3>
           <div className="stats">
-            <div className="location-item"><strong>Distance</strong><div className="small">{stats.distance} meters</div></div>
-            <div className="location-item"><strong>Calc Speed</strong><div className="small">{stats.speed} m/s ({(stats.speed * 3.6).toFixed(2)} km/h)</div></div>
-            <div className="location-item"><strong>Δ Time</strong><div className="small">{stats.timeDiff} s</div></div>
-            <div className="location-item"><strong>Vel Lat</strong><div className="small">{stats.velocity.lat} °/s</div></div>
-            <div className="location-item"><strong>Vel Lon</strong><div className="small">{stats.velocity.lon} °/s</div></div>
+            <div className="location-item"><strong>Distance (Δs)</strong><div className="small">{stats.distance} m</div></div>
+            <div className="location-item"><strong>Time Interval (Δt)</strong><div className="small">{stats.timeDiff} s</div></div>
+            <div className="location-item"><strong>Speed (v = Δs/Δt)</strong><div className="small">{stats.speed} m/s ({(stats.speed * 3.6).toFixed(2)} km/h)</div></div>
+            <div className="location-item"><strong>Velocity Magnitude</strong><div className="small">{stats.velocity.magnitude} m/s</div></div>
+            <div className="location-item"><strong>Velocity Lat (v_y)</strong><div className="small">{stats.velocity.lat} °/s</div></div>
+            <div className="location-item"><strong>Velocity Lon (v_x)</strong><div className="small">{stats.velocity.lon} °/s</div></div>
+            {stats.acceleration && parseFloat(stats.acceleration.scalar) !== 0 && (
+              <>
+                <div className="location-item"><strong>Acceleration (a = Δv/Δt)</strong><div className="small">{stats.acceleration.scalar} m/s²</div></div>
+                <div className="location-item"><strong>Accel Lat (a_y)</strong><div className="small">{stats.acceleration.lat} °/s²</div></div>
+                <div className="location-item"><strong>Accel Lon (a_x)</strong><div className="small">{stats.acceleration.lon} °/s²</div></div>
+              </>
+            )}
           </div>
+        </div>
+      )}
+
+      {location && (
+        <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
+          <h3 style={{ margin: '12px 16px' }}>Live Map</h3>
+          <MapContainer 
+            center={[location.latitude, location.longitude]} 
+            zoom={16} 
+            style={{ height: '300px', width: '100%' }}
+          >
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            />
+            <Marker position={[location.latitude, location.longitude]}>
+              <Popup>
+                Current Location<br />
+                Lat: {location.latitude.toFixed(6)}<br />
+                Lon: {location.longitude.toFixed(6)}
+              </Popup>
+            </Marker>
+            {previousLocation && (
+              <Polyline 
+                positions={[
+                  [previousLocation.latitude, previousLocation.longitude],
+                  [location.latitude, location.longitude]
+                ]} 
+                color="blue"
+                weight={3}
+              />
+            )}
+            <CompassControl />
+            <MapUpdater center={[location.latitude, location.longitude]} />
+          </MapContainer>
         </div>
       )}
     </div>
